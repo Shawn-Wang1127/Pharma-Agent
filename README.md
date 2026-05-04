@@ -1,27 +1,27 @@
 # Pharma-Agent (原 Pharma-RAG Assistant)
 
-本项目在 V3.1 封版阶段，已实现从基础 RAG 到全自动多智能体数据管线的跨越，具备以下四大核心能力：
+本项目是一个 biomedical AI agent prototype，围绕本地 RAG、PubMed 检索、CSV 数据分析和 FastAPI 服务层组织，当前具备以下四类主要能力：
 
-1. **高密级私有化 RAG 引擎 (Secure Local RAG)**
-   * **功能描述**：基于本地部署的 BAAI/bge-m3 向量模型与 ChromaDB，实现对院内/企业级高保密医学文献（如临床试验核心报告）的纯离线语义检索与可信溯源。
+1. **本地 RAG 引擎 (Local RAG)**
+   * **功能描述**：基于本地部署的 BAAI/bge-m3 向量模型与 ChromaDB，对医学文献或临床试验材料提供离线语义检索与来源追踪。
    * **应用场景**：解答特定靶点机制、提炼临床试验核心结论。
 
-2. **全网医学文献实时抓取 (Global PubMed Fetcher)**
-   * **功能描述**：集成 Biopython 并动态调度 NCBI Entrez API，穿透本地知识库的时间壁垒，实时抓取并总结全球最新的生物医学研究进展。
+2. **PubMed 文献检索 (PubMed Retrieval)**
+   * **功能描述**：集成 Biopython 并调度 NCBI Entrez API，支持按查询抓取公开的生物医学文献并生成摘要式结果。
    * **应用场景**：横向对比本地结论与全球前沿真实世界数据，交叉验证预后因素（如 TP53 共突变）的一致性。
 
-3. **全自动防幻觉数据沙盒 (Autonomous Analytics Sandbox)**
-   * **功能描述**：内置隔离的 Python REPL 环境。智能体具备 **Schema 探查（表结构感知）** 能力，可自动读取结构化临床数据（CSV），独立编写 Pandas/SciPy 脚本进行复杂临床指标计算（如生存期 OS 差异与 p-value 统计），并调用 Matplotlib 渲染专业统计图表。
-   * **工程亮点**：搭载代码执行断路器与自修复机制（Self-Correction），遇到报错自动重写逻辑，彻底杜绝数据捏造与代码死循环。生成的图表自动挂载至 FastAPI 静态路由，支持前后端同屏协同渲染。
+3. **CSV 数据分析工具链 (Analytics Sandbox)**
+   * **功能描述**：提供受控的 Python 执行工具和 CSV 预览能力，方便读取结构化临床数据后编写 Pandas/SciPy 脚本完成统计计算，并用 Matplotlib 生成图表。
+   * **工程亮点**：工具链支持基于真实列名的分析流程，并在出错时把 traceback 返回给智能体继续修正；生成的图表可通过 FastAPI 静态路由访问，便于前后端协同查看。
 
-4. **企业级后端与全栈容器化 (Enterprise Backend & Dockerization)**
-   * **功能描述**：底层基于 LangGraph 状态机构建，暴露标准化 RESTful API (`POST /agent/chat`)。原生支持基于 `session_id` 的多租户并发请求隔离与对话状态持久化。
-   * **部署方案**：提供极简的 Docker 容器封装配置，彻底消解复杂的 Python 生态依赖与 C++ 编译环境冲突，实现真正的跨平台“开箱即用”。
+4. **FastAPI + LangGraph 服务层**
+   * **功能描述**：底层基于 LangGraph 状态机构建，暴露标准化 RESTful API (`POST /agent/chat`)。通过 `session_id` 区分会话上下文，适合单进程内的多轮交互演示。
+   * **部署方案**：提供 Docker 容器封装，尽量减少 Python 依赖和本地编译环境差异带来的部署摩擦。
 ---
 
 ## 🛠️ 全景技术栈 (Technology Stack)
 
-系统采用高度模块化的微服务架构设计，底层组件完全开源可控：
+系统采用较为清晰的模块化组合，底层组件均为开源库：
 
 * 🧠 **AI 与智能体编排**: `LangGraph`, `LangChain`, `DeepSeek-V3` (Tool Calling)
 * 🗄️ **向量检索 (RAG)**: `ChromaDB`, `BAAI/bge-m3` (本地私有化 Embedding)
@@ -34,7 +34,7 @@
 
 ## 🚀 快速开始 (Quick Start with Docker)
 
-本项目已完成全栈容器化，底层依赖（包括科学计算库与运行环境）已完全封装。
+本项目提供 Docker 化运行方式，便于在一致的环境中启动服务和演示原型能力。
 
 ### 1. 前置准备
 在首次运行前，请确保生成本地临床测试数据（Agent 数据分析沙盒的运行底座）：
@@ -95,7 +95,7 @@ Agent 生成数据分析图表后可通过静态路由直接访问，例如：
 
 ## 🖥️ 附加测试工具：Gradio UI (Legacy V1.0)
 
-本项目保留了早期 V1.0 版本的交互式 Web UI，提供单纯的 RAG 打字机流式输出体验（不包含 Agent 路由与代码沙盒模块）。该模式脱离 Docker 运行，主要用于算法基础测试。
+本项目保留了早期 V1.0 版本的交互式 Web UI，提供基础的 RAG 流式输出体验，不包含 Agent 路由与代码执行工具。该模式可脱离 Docker 运行，主要用于早期验证和算法测试。
 
 [https://github.com/user-attachments/assets/50fdceb4-10a0-49ac-9d7a-a1b6283ac31d](https://github.com/user-attachments/assets/50fdceb4-10a0-49ac-9d7a-a1b6283ac31d)
 
