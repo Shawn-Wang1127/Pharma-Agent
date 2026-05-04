@@ -1,8 +1,9 @@
 import os
 import logging
 import json
-import multiprocessing as mp
-from queue import Empty
+import subprocess
+import sys
+import ast
 from typing import Annotated, TypedDict
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -20,6 +21,27 @@ load_dotenv()
 EXECUTION_TIMEOUT_SECONDS = 10
 MAX_STDOUT_CHARS = 4000
 MAX_TRACEBACK_CHARS = 6000
+BLOCKED_EXECUTION_MODULES = {
+    "builtins",
+    "ctypes",
+    "glob",
+    "http",
+    "importlib",
+    "os",
+    "pathlib",
+    "pkgutil",
+    "requests",
+    "shutil",
+    "socket",
+    "subprocess",
+    "tempfile",
+    "threading",
+    "urllib",
+}
+BLOCKED_CALLS = {
+    ("os", "system"),
+    ("os", "popen"),
+}
 
 
 def _truncate_text(text: str, limit: int, label: str) -> str:
@@ -28,24 +50,261 @@ def _truncate_text(text: str, limit: int, label: str) -> str:
     return f"{text[:limit]}\n...[{label} truncated to {limit} chars]"
 
 
-def _execute_python_code_worker(code: str, result_queue) -> None:
+class ExecutionRestrictionError(Exception):
+    pass
+
+
+def _build_safe_builtins(safe_import, safe_open):
+    import builtins as py_builtins
+
+    def _blocked_builtin(name: str):
+        def _raiser(*args, **kwargs):
+            raise ExecutionRestrictionError(
+                f"Use of builtin '{name}' is not allowed in this prototype controlled execution tool."
+            )
+
+        return _raiser
+
+    safe_builtin_names = [
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "divmod",
+        "enumerate",
+        "Exception",
+        "filter",
+        "float",
+        "format",
+        "frozenset",
+        "hash",
+        "hex",
+        "int",
+        "isinstance",
+        "issubclass",
+        "iter",
+        "len",
+        "list",
+        "map",
+        "max",
+        "min",
+        "next",
+        "object",
+        "ord",
+        "pow",
+        "print",
+        "range",
+        "reversed",
+        "round",
+        "set",
+        "slice",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "type",
+        "zip",
+        "ArithmeticError",
+        "AssertionError",
+        "AttributeError",
+        "EOFError",
+        "Exception",
+        "IndexError",
+        "KeyError",
+        "NameError",
+        "RuntimeError",
+        "TypeError",
+        "ValueError",
+        "ZeroDivisionError",
+    ]
+
+    safe_builtins = {name: getattr(py_builtins, name) for name in safe_builtin_names if hasattr(py_builtins, name)}
+    safe_builtins["open"] = safe_open
+    safe_builtins["eval"] = _blocked_builtin("eval")
+    safe_builtins["exec"] = _blocked_builtin("exec")
+    safe_builtins["compile"] = _blocked_builtin("compile")
+    safe_builtins["input"] = _blocked_builtin("input")
+    safe_builtins["__import__"] = safe_import
+
+    return safe_builtins
+
+
+def _safe_open_factory(original_open, clinical_data_root: str):
+    def _safe_open(file, mode="r", *args, **kwargs):
+        file_path = os.fspath(file)
+        normalized_mode = (mode or "r").lower()
+        is_mixed_mode = "+" in normalized_mode
+        is_write_mode = any(flag in normalized_mode for flag in ("w", "a", "x"))
+        is_read_mode = not is_write_mode and not is_mixed_mode
+
+        resolved_path = os.path.abspath(os.path.normpath(file_path))
+        try:
+            common_root = os.path.commonpath([resolved_path, clinical_data_root])
+        except ValueError:
+            raise ExecutionRestrictionError(
+                "Only files under clinical_data are allowed."
+            ) from None
+
+        if common_root != clinical_data_root:
+            raise ExecutionRestrictionError(
+                "Only files under clinical_data are allowed."
+            )
+
+        relative_path = os.path.relpath(resolved_path, clinical_data_root)
+        path_parts = relative_path.split(os.sep)
+        if any(part.startswith(".") for part in path_parts):
+            raise ExecutionRestrictionError("Hidden files are not allowed.")
+
+        if os.path.basename(resolved_path).startswith("."):
+            raise ExecutionRestrictionError("Hidden files are not allowed.")
+
+        if is_read_mode and resolved_path.lower().endswith(".csv"):
+            return original_open(file, mode, *args, **kwargs)
+
+        if is_write_mode and resolved_path.lower().endswith(".png"):
+            if is_mixed_mode:
+                sanitized_mode = normalized_mode.replace("+", "")
+                return original_open(file, sanitized_mode, *args, **kwargs)
+            return original_open(file, mode, *args, **kwargs)
+
+        if is_mixed_mode:
+            raise ExecutionRestrictionError(
+                "Mixed read/write file modes are not allowed in this prototype controlled execution tool."
+            )
+
+        if is_write_mode:
+            raise ExecutionRestrictionError(
+                "File writing is only allowed for PNG files under clinical_data."
+            )
+
+        raise ExecutionRestrictionError(
+            "File reading is only allowed for CSV files under clinical_data."
+        )
+
+    return _safe_open
+
+
+def _safe_import_factory(original_import):
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root_name = name.split(".", 1)[0]
+        if root_name in BLOCKED_EXECUTION_MODULES:
+            raise ExecutionRestrictionError(
+                f"Import of module '{root_name}' is not allowed in this prototype controlled execution tool."
+            )
+        return original_import(name, globals, locals, fromlist, level)
+
+    return _safe_import
+
+
+def _validate_user_code(code: str) -> None:
+    try:
+        parsed = ast.parse(code)
+    except SyntaxError:
+        raise
+
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_name = alias.name.split(".", 1)[0]
+                if root_name in BLOCKED_EXECUTION_MODULES:
+                    raise ExecutionRestrictionError(
+                        f"Import of module '{root_name}' is not allowed in this prototype controlled execution tool."
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                root_name = node.module.split(".", 1)[0]
+                if root_name in BLOCKED_EXECUTION_MODULES:
+                    raise ExecutionRestrictionError(
+                        f"Import of module '{root_name}' is not allowed in this prototype controlled execution tool."
+                    )
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                call_key = (node.func.value.id, node.func.attr)
+                if call_key in BLOCKED_CALLS:
+                    raise ExecutionRestrictionError(
+                        f"Call to '{call_key[0]}.{call_key[1]}' is not allowed in this prototype controlled execution tool."
+                    )
+
+
+SUBPROCESS_RUNNER_SOURCE = """
+import json
+import os
+import sys
+
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
+import agent_engine
+
+payload = json.loads(sys.stdin.read())
+status, result = agent_engine._run_restricted_python_code(payload.get("code", ""))
+sys.stdout.write(json.dumps({"status": status, "payload": result}, ensure_ascii=False))
+"""
+
+
+def _run_restricted_python_code(code: str):
     import io
+    import builtins as py_builtins
     import sys
     import traceback
+    # Preload common safe modules so prototype execution can still use them after import filtering is enabled.
+    import collections
+    import copy
+    import copyreg
+    import codecs
+    import datetime
+    import decimal
+    import fractions
+    import functools
+    import itertools
+    import json
+    import math
+    import numbers
+    import operator
+    import random
+    import re
+    import statistics
+    import time
+    import types
+    import typing
+    import warnings
+    import weakref
     import pandas as pd
     import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    clinical_data_root = os.path.abspath("clinical_data")
+    original_open = py_builtins.open
+    original_import = py_builtins.__import__
+    safe_import = _safe_import_factory(original_import)
+    safe_open = _safe_open_factory(original_open, clinical_data_root)
+    py_builtins.open = safe_open
 
     old_stdout = sys.stdout
     redirected_output = io.StringIO()
     sys.stdout = redirected_output
     try:
-        local_vars = {"pd": pd, "np": np}
-        exec(code, {}, local_vars)
+        _validate_user_code(code)
+        safe_globals = {
+            "__builtins__": _build_safe_builtins(safe_import, safe_open),
+            "__name__": "__main__",
+            "pd": pd,
+            "np": np,
+            "matplotlib": matplotlib,
+            "plt": plt,
+        }
+        safe_locals = {"pd": pd, "np": np, "matplotlib": matplotlib, "plt": plt}
+        exec(code, safe_globals, safe_locals)
         output = redirected_output.getvalue()
-        result_queue.put(("ok", output))
+        return "ok", output
+    except ExecutionRestrictionError as e:
+        return "error", str(e)
     except Exception:
-        result_queue.put(("error", traceback.format_exc()))
+        return "error", traceback.format_exc()
     finally:
+        py_builtins.open = original_open
         sys.stdout = old_stdout
 
 # ==========================================
@@ -217,31 +476,37 @@ class PharmaAgentEngine:
             
         @tool
         def execute_python_code(code: str) -> str:
-            """Executes dynamically generated Python scripts in a controlled REPL-style runner."""
-            logger.info("[TOOL] Executing [execute_python_code] sandbox instance...")
-            ctx = mp.get_context("spawn")
-            result_queue = ctx.Queue()
-            process = ctx.Process(
-                target=_execute_python_code_worker,
-                args=(code, result_queue),
-            )
-            process.start()
-            process.join(EXECUTION_TIMEOUT_SECONDS)
-
-            if process.is_alive():
+            """Executes dynamically generated Python scripts in a prototype controlled execution tool."""
+            logger.info("[TOOL] Executing [execute_python_code] controlled execution instance...")
+            env = os.environ.copy()
+            env["PYTHON_DOTENV_DISABLED"] = "1"
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", SUBPROCESS_RUNNER_SOURCE],
+                    input=json.dumps({"code": code}, ensure_ascii=False),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=EXECUTION_TIMEOUT_SECONDS,
+                    cwd=os.getcwd(),
+                    env=env,
+                    shell=False,
+                )
+            except subprocess.TimeoutExpired:
                 logger.error("[TOOL] Python execution timed out.")
-                process.terminate()
-                process.join()
                 return f"Execution timed out after {EXECUTION_TIMEOUT_SECONDS} seconds. Please simplify the code and try again."
 
             try:
-                status, payload = result_queue.get(timeout=1)
-            except Empty:
+                result = json.loads(completed.stdout)
+                status = result.get("status")
+                payload = result.get("payload", "")
+            except json.JSONDecodeError:
                 logger.error("[TOOL] Python execution finished without returning a result.")
                 return "Execution failed before producing a result. Please revise the code and try again."
-            finally:
-                result_queue.close()
-                result_queue.join_thread()
+
+            if completed.returncode != 0 and status != "error":
+                logger.error("[TOOL] Python execution subprocess failed.")
+                return "Execution failed before producing a result. Please revise the code and try again."
 
             if status == "ok":
                 output = payload
@@ -252,7 +517,7 @@ class PharmaAgentEngine:
                     return f"Execution successful. Stdout:\n{truncated_output}"
                 return f"Execution successful. Stdout:\n{output}"
 
-            logger.error("[TOOL] Sandbox exception raised.")
+            logger.error("[TOOL] Execution exception raised.")
             truncated_error = _truncate_text(payload, MAX_TRACEBACK_CHARS, "traceback")
             return (
                 "Execution encountered an exception. Analyze the traceback and revise the code:\n"
