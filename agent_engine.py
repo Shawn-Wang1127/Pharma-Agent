@@ -78,6 +78,41 @@ class PharmaAgentEngine:
         self.app = self._build_graph()
 
     def _build_graph(self):
+        clinical_data_root = os.path.abspath("clinical_data")
+
+        def _resolve_clinical_csv_path(filepath: str):
+            if not isinstance(filepath, str) or not filepath.strip():
+                return None, "Only CSV files under clinical_data are allowed."
+
+            normalized_input = os.path.normpath(filepath.strip())
+            candidate_path = normalized_input
+            if not os.path.isabs(candidate_path):
+                candidate_path = os.path.abspath(candidate_path)
+
+            try:
+                common_root = os.path.commonpath([candidate_path, clinical_data_root])
+            except ValueError:
+                return None, "Only CSV files under clinical_data are allowed."
+
+            if common_root != clinical_data_root:
+                return None, "Only CSV files under clinical_data are allowed."
+
+            if not candidate_path.lower().endswith(".csv"):
+                return None, "Only CSV files under clinical_data are allowed."
+
+            relative_path = os.path.relpath(candidate_path, clinical_data_root)
+            path_parts = relative_path.split(os.sep)
+            if any(part.startswith(".") for part in path_parts):
+                return None, "Hidden files are not allowed."
+
+            if os.path.basename(candidate_path).startswith("."):
+                return None, "Hidden files are not allowed."
+
+            if not os.path.isfile(candidate_path):
+                return None, "CSV file not found under clinical_data."
+
+            return candidate_path, None
+
         @tool
         def search_medical_literature(query: str) -> str:
             """Retrieves context from the local, high-security medical knowledge base (ChromaDB)."""
@@ -132,14 +167,20 @@ class PharmaAgentEngine:
         def preview_csv_data(filepath: str) -> str:
             """Extracts structural metadata (schema, dtypes) and data samples from a CSV file."""
             import pandas as pd
-            logger.info(f"[TOOL] Executing [preview_csv_data] for: {filepath}")
+            safe_name = os.path.basename(filepath) if isinstance(filepath, str) and filepath.strip() else "unknown"
+            logger.info(f"[TOOL] Executing [preview_csv_data] for: {safe_name}")
             try:
-                df = pd.read_csv(filepath)
-                info = f"[Dataset Overview] {filepath}\nRows: {len(df)} | Columns: {len(df.columns)}\n\n"
+                resolved_path, error_message = _resolve_clinical_csv_path(filepath)
+                if error_message:
+                    return error_message
+
+                df = pd.read_csv(resolved_path)
+                info = f"[Dataset Overview] {os.path.basename(resolved_path)}\nRows: {len(df)} | Columns: {len(df.columns)}\n\n"
                 info += f"[Schema & Data Types]\n{df.dtypes.to_string()}\n\n[Data Sample (Top 3 rows)]\n{df.head(3).to_string()}"
                 return info
             except Exception as e:
-                return f"Failed to probe file. Verify path integrity: {str(e)}"
+                logger.error("[TOOL] preview_csv_data failed during CSV inspection.")
+                return "Failed to probe CSV file under clinical_data."
             
         @tool
         def execute_python_code(code: str) -> str:
