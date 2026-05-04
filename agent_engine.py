@@ -1,6 +1,8 @@
 import os
 import logging
 import json
+import multiprocessing as mp
+from queue import Empty
 from typing import Annotated, TypedDict
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -14,6 +16,37 @@ from langgraph.checkpoint.memory import MemorySaver
 from core import BioAssistant
 
 load_dotenv()
+
+EXECUTION_TIMEOUT_SECONDS = 10
+MAX_STDOUT_CHARS = 4000
+MAX_TRACEBACK_CHARS = 6000
+
+
+def _truncate_text(text: str, limit: int, label: str) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[{label} truncated to {limit} chars]"
+
+
+def _execute_python_code_worker(code: str, result_queue) -> None:
+    import io
+    import sys
+    import traceback
+    import pandas as pd
+    import numpy as np
+
+    old_stdout = sys.stdout
+    redirected_output = io.StringIO()
+    sys.stdout = redirected_output
+    try:
+        local_vars = {"pd": pd, "np": np}
+        exec(code, {}, local_vars)
+        output = redirected_output.getvalue()
+        result_queue.put(("ok", output))
+    except Exception:
+        result_queue.put(("error", traceback.format_exc()))
+    finally:
+        sys.stdout = old_stdout
 
 # ==========================================
 # 1. Industrial Logging Configuration
@@ -184,29 +217,47 @@ class PharmaAgentEngine:
             
         @tool
         def execute_python_code(code: str) -> str:
-            """Executes dynamically generated Python scripts in an isolated REPL sandbox."""
-            import sys
-            import io
-            import traceback
-            import pandas as pd
-            import numpy as np
+            """Executes dynamically generated Python scripts in a controlled REPL-style runner."""
             logger.info("[TOOL] Executing [execute_python_code] sandbox instance...")
-            old_stdout = sys.stdout
-            redirected_output = io.StringIO()
-            sys.stdout = redirected_output
+            ctx = mp.get_context("spawn")
+            result_queue = ctx.Queue()
+            process = ctx.Process(
+                target=_execute_python_code_worker,
+                args=(code, result_queue),
+            )
+            process.start()
+            process.join(EXECUTION_TIMEOUT_SECONDS)
+
+            if process.is_alive():
+                logger.error("[TOOL] Python execution timed out.")
+                process.terminate()
+                process.join()
+                return f"Execution timed out after {EXECUTION_TIMEOUT_SECONDS} seconds. Please simplify the code and try again."
+
             try:
-                local_vars = {'pd': pd, 'np': np}
-                exec(code, {}, local_vars)
-                output = redirected_output.getvalue()
+                status, payload = result_queue.get(timeout=1)
+            except Empty:
+                logger.error("[TOOL] Python execution finished without returning a result.")
+                return "Execution failed before producing a result. Please revise the code and try again."
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+            if status == "ok":
+                output = payload
                 if not output.strip():
                     return "Execution completed successfully, but no output was intercepted. Ensure print() statements are used."
+                truncated_output = _truncate_text(output, MAX_STDOUT_CHARS, "stdout")
+                if len(truncated_output) != len(output):
+                    return f"Execution successful. Stdout:\n{truncated_output}"
                 return f"Execution successful. Stdout:\n{output}"
-            except Exception as e:
-                error_msg = traceback.format_exc()
-                logger.error(f"[TOOL] Sandbox exception raised.")
-                return f"Execution encountered an exception. Analyze the traceback and revise the code:\n{error_msg}"
-            finally:
-                sys.stdout = old_stdout
+
+            logger.error("[TOOL] Sandbox exception raised.")
+            truncated_error = _truncate_text(payload, MAX_TRACEBACK_CHARS, "traceback")
+            return (
+                "Execution encountered an exception. Analyze the traceback and revise the code:\n"
+                f"{truncated_error}"
+            )
 
         tools = [search_medical_literature, search_pubmed_literature, preview_csv_data, execute_python_code]
         
