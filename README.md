@@ -52,6 +52,8 @@ docker build -t pharma-agent:v3.1 .
 docker run -p 8000:8000 pharma-agent:v3.1
 ```
 
+构建镜像时，`.dockerignore` 会排除本地 `.env`、向量库、PDF 数据、缓存与生成图片；如需 API 密钥或私有数据，请在运行容器时通过环境变量或受控挂载方式提供，不要打包进镜像。本地向量库需预构建后挂载，或在容器内按需另行构建。
+
 ### 3. API 接口调试
 容器启动成功后，访问交互式 API 文档 (Swagger UI)：
 👉 **`http://127.0.0.1:8000/docs`**

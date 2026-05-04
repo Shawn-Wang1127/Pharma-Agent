@@ -5,7 +5,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # 安装底层 C++ 编译环境（防止 ChromaDB 等生信库编译失败）
-RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖文件并安装
 COPY requirements.txt .
@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制项目所有文件到工作目录
 COPY . .
 
-# 预先创建系统运行必须的挂载目录
-RUN mkdir -p clinical_data data chroma_db chroma_db_bge_m3
+# 预先创建系统运行必须的输出目录；向量库和 PDF 数据应通过受控挂载提供
+RUN mkdir -p clinical_data
 
 # 暴露 FastAPI 运行端口
 EXPOSE 8000
