@@ -1,0 +1,46 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*token*
+*secret*
+*credential*
+
+# Git and editor metadata
+.git
+.gitignore
+.gitattributes
+.vscode/
+
+# Python caches and local runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local vector databases and generated retrieval artifacts
+chroma_db/
+chroma_db_bge_m3/
+
+# Source PDFs and local data folders should not enter the image by default
+data/
+sample_data/
+archive/
+*.pdf
+
+# Generated clinical outputs; keep the mock CSV available if present
+clinical_data/*.png
+clinical_data/*.jpg
+clinical_data/*.jpeg
+clinical_data/*.svg
+!clinical_data/lung_cancer_mock_data.csv
+
+# Large or binary model/data artifacts
+*.sqlite
+*.db
+*.pkl
+*.bin
+*.npy
+*.npz
+*.parquet
